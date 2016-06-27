@@ -1,5 +1,6 @@
 package com.rabajaba.rxutils;
 
+import org.javatuples.Pair;
 import org.junit.Ignore;
 import org.junit.Test;
 import rx.Observable;
@@ -10,6 +11,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -19,6 +21,7 @@ public class PortionObservableTest {
     private static final int TOTAL = 50;
     private static final RuntimeException testExceptionInstance = new RuntimeException();
     private static List<PortionObservable.Range> ranges;
+    private Integer tmpValue = 0;
 
     @Test
     public void basicPortionTest() throws Exception {
@@ -168,6 +171,105 @@ public class PortionObservableTest {
         }
         // now we need to validate what set of ranges were asked
         assertEquals("This test reads the whole stream, so should have all available ranges", 101, ranges.size());
+    }
+
+    @Test
+    public void subscribeInSmallerPortionsThanLimitShouldSuceed() throws Exception {
+        for (int x = 0; x < 100; x++) {
+            AtomicInteger emitted = new AtomicInteger(0);
+            CopyOnWriteArrayList<Pair<PortionObservable.Range, Integer>> rng = new CopyOnWriteArrayList<>();
+            TestSubscriber<Integer> subs = new TestSubscriber<>();
+            PortionObservable
+                    .newInstance(10,
+                            range -> {
+                                rng.add(Pair.with(range, emitted.get()));
+                                return Observable.range(range.getOffset(), range.getLimit(), Schedulers.io())
+                                        .map(i -> {
+                                            // emulate some async work
+                                            try {
+                                                Thread.sleep(1);
+                                            } catch (InterruptedException e) {
+                                                e.printStackTrace();
+                                            }
+                                            return i;
+                                        })
+                                        .filter(i -> i < 45);
+                            })
+                    .concatMap(data -> Observable.just(data)
+                            .map(d -> {
+                                for (int i = 0; i < 100000; i++) {
+                                    tmpValue++;
+                                }
+                                emitted.incrementAndGet();
+                                return d;
+                            })
+                    )
+                    .count()
+                    .subscribeOn(Schedulers.computation())
+                    .subscribe(subs);
+            subs.awaitTerminalEvent(1, TimeUnit.SECONDS);
+            subs.assertNoErrors();
+            subs.assertCompleted();
+            List<Integer> count = subs.getOnNextEvents();
+            assertEquals("Size of emitted items should be same as 'getNextPortion' function emitted", Integer.valueOf(45), count.get(0));
+            // now we need to validate what set of ranges were asked
+            assertEquals("This test reads the whole stream, so should have all available ranges", 5, rng.size());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(0), rng.get(0).getValue0().getOffset());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(10), rng.get(1).getValue0().getOffset());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(20), rng.get(2).getValue0().getOffset());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(30), rng.get(3).getValue0().getOffset());
+            assertEquals("Last call is always expecting for an empty portion", Integer.valueOf(40), rng.get(4).getValue0().getOffset());
+            assertTrue(tmpValue % 100000 == 0);
+        }
+    }
+
+    @Test
+    @Ignore
+    /**
+     * Ignored, since it requires fully serialized behavior of portion reader.
+     * Special mode should be created for such behaviour.
+     */
+    public void subscribeInSmallerPortionsThanLimitShouldNotReadMoreData() throws Exception {
+        for (int x = 0; x < 1000; x++) {
+            AtomicInteger emitted = new AtomicInteger(0);
+            ranges = new CopyOnWriteArrayList<>();
+            TestSubscriber<Integer> subs = new TestSubscriber<>();
+            int limit = 10;
+            PortionObservable
+                    .newInstance(limit,
+                            range -> {
+                                assertEquals("Next portion can be requested only when full previous page had been read", 0, emitted.get() % limit);
+                                ranges.add(range);
+                                return Observable.range(range.getOffset(), range.getLimit(), Schedulers.io())
+                                        .filter(i -> i < 45);
+                            })
+                    .concatMap(data -> Observable.just(data)
+                            .map(d -> {
+                                for (int i = 0; i < 100000; i++) {
+                                    tmpValue++;
+                                }
+                                emitted.incrementAndGet();
+                                return d;
+                            })
+                    )
+                    .count()
+                    .subscribeOn(Schedulers.computation())
+                    .subscribe(subs);
+            subs.awaitTerminalEvent(1, TimeUnit.SECONDS);
+            subs.assertNoErrors();
+            subs.assertCompleted();
+            List<Integer> count = subs.getOnNextEvents();
+            assertEquals("Size of emitted items should be same as 'getNextPortion' function emitted", Integer.valueOf(45), count.get(0));
+            // now we need to validate what set of ranges were asked
+            assertEquals("This test reads the whole stream, so should have all available ranges", 5, ranges.size());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(0), ranges.get(0).getOffset());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(10), ranges.get(1).getOffset());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(20), ranges.get(2).getOffset());
+            assertEquals("Ranges should be in sequential order", Integer.valueOf(30), ranges.get(3).getOffset());
+            assertEquals("Last call is always expecting for an empty portion", Integer.valueOf(40), ranges.get(4).getOffset());
+            assertTrue(tmpValue % 100000 == 0);
+            Thread.sleep(50);
+        }
     }
 
     @Test

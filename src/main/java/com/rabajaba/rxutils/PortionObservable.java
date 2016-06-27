@@ -1,5 +1,7 @@
 package com.rabajaba.rxutils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import rx.Observable;
 import rx.Producer;
 import rx.Scheduler;
@@ -10,6 +12,7 @@ import rx.schedulers.Schedulers;
 import rx.subjects.PublishSubject;
 import rx.subjects.SerializedSubject;
 
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -35,6 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * @param <T> type of instances this observable is using
  */
 public final class PortionObservable<T> {
+    private static final Logger log = LoggerFactory.getLogger(PortionObservable.class);
     /**
      * This thread pool is used for subscription of portion read, to avoid recursion calls
      */
@@ -76,7 +80,7 @@ public final class PortionObservable<T> {
      * @param limit          how much data to ask for at once
      * @param getNextPortion function to retrieve data, should have it's own {@link rx.Scheduler} set, if it has blocking operations
      * @param <O>            type of instances you're interested in
-     * @param scheduler      scheduler this new observable will be executed on\9
+     * @param scheduler      scheduler this new observable will be executed on
      * @return new cold Observable, which will start to emit data only after it's subscribed
      */
     public static <O> Observable<O> newInstance(int limit, Func1<Range, Observable<O>> getNextPortion, FinishMode mode, Scheduler scheduler) {
@@ -164,15 +168,15 @@ public final class PortionObservable<T> {
         final private AtomicInteger pageCounter = new AtomicInteger(0);
         private final Func1<Range, Observable<T>> function;
         private final Integer limit;
-        // used for fastpath
-        private Scheduler scheduler;
-
         // used for slowpath
         private final SerializedSubject<Range, Range> slowpathEmitter;
         private final Queue<T> itemsToPush = new ConcurrentLinkedQueue<>();
         private final Queue<Range> additionalPages = new ConcurrentLinkedQueue<>();
         // Stores start of {@link #slowpathEmitter}, so if it's over no more data on additionalPages would be read.
         private final AtomicBoolean finished = new AtomicBoolean(false);
+        // used for fastpath
+        private Scheduler scheduler;
+        private AtomicBoolean listPagesWarningShown = new AtomicBoolean(false);
 
         private PortionProducer(Subscriber<? super T> childSubscriber, FinishMode mode, Func1<Range, Observable<T>> function, Integer limit,
                                 Scheduler scheduler) {
@@ -196,8 +200,13 @@ public final class PortionObservable<T> {
                     })
                     // sequential read of portions
                     .concatMap(range -> function.call(range)
-                            .toList()
-                    )
+                            .doOnNext(value -> {
+                                if (value instanceof List && mode.equals(FinishMode.ONLY_ON_EMPTY) && !listPagesWarningShown.get()) {
+                                    log.warn("Finish mode 'Only on Empty' will read data until it'll get completely empty page. Doing .toList()" +
+                                            " on portion reader will cause it read data forever and never finish.");
+                                    listPagesWarningShown.set(true);
+                                }
+                            }).toList())
                     .takeUntil(page -> {
                         if (mode.equals(FinishMode.ONLY_ON_EMPTY)) {
                             return page.size() == 0;
@@ -208,16 +217,7 @@ public final class PortionObservable<T> {
                     .subscribe(page -> {
                                 page.forEach(item -> itemsToPush.add(item));
                                 // now we can drain queue
-                                while (get() > 0 && itemsToPush.size() > 0) {
-                                    if (decrementAndGet() >= 0) {
-                                        T next = itemsToPush.poll();
-                                        if (next == null) {
-                                            incrementAndGet(); // setting value back, because no values available
-                                            break;
-                                        }
-                                        childSubscriber.onNext(next);
-                                    }
-                                }
+                                drain(childSubscriber);
                                 // all the things not send to a child are expecting to be hosted in a queue until next portion request
                                 if (get() >= 0 && itemsToPush.size() == 0) {
                                     // if new portion is not full - we still should get enough of data to push to a child subscriber
@@ -226,7 +226,7 @@ public final class PortionObservable<T> {
                                         // need to validate we're not over requesting next additionalPages
                                         if (additionalPages.size() == 0) { // only one additional pageCounter at a time is allowed
                                             // trigger one more pageCounter
-                                            Range range = new Range(limit, limit * this.pageCounter.getAndIncrement());
+                                            Range range = new Range(limit, limit * pageCounter.getAndIncrement());
                                             additionalPages.add(range); // store state - we have additional page to be read
                                             slowpathEmitter.onNext(range);
                                         }
@@ -248,6 +248,19 @@ public final class PortionObservable<T> {
                                 }
                             }
                     );
+        }
+
+        private void drain(Subscriber<? super T> childSubscriber) {
+            while (get() > 0 && itemsToPush.size() > 0) {
+                if (decrementAndGet() >= 0 && itemsToPush.size() > 0) {
+                    T next = itemsToPush.poll();
+                    if (next == null) {
+                        incrementAndGet(); // setting value back, because no values available
+                        break;
+                    }
+                    childSubscriber.onNext(next);
+                }
+            }
         }
 
         @Override
@@ -302,12 +315,16 @@ public final class PortionObservable<T> {
                     }
                 }
             } else {
-                // preparing set of portions to read
-                if (requestedAmount < limit) {
-                    slowpathEmitter.onNext(new Range(limit, limit * pageCounter.getAndIncrement()));
-                } else {
-                    for (int i = 0; i < requestedAmount / limit; i++) {
+                drain(childSubscriber);
+                // if there is something still requested, we should trigger next page
+                if (get() > 0) {
+                    // preparing set of portions to read
+                    if (requestedAmount < limit) {
                         slowpathEmitter.onNext(new Range(limit, limit * pageCounter.getAndIncrement()));
+                    } else {
+                        for (int i = 0; i < requestedAmount / limit; i++) {
+                            slowpathEmitter.onNext(new Range(limit, limit * pageCounter.getAndIncrement()));
+                        }
                     }
                 }
             }
